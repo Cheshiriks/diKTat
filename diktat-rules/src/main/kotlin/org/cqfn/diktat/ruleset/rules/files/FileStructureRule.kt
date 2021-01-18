@@ -10,34 +10,29 @@ import org.cqfn.diktat.ruleset.constants.Warnings.FILE_INCORRECT_BLOCKS_ORDER
 import org.cqfn.diktat.ruleset.constants.Warnings.FILE_NO_BLANK_LINE_BETWEEN_BLOCKS
 import org.cqfn.diktat.ruleset.constants.Warnings.FILE_UNORDERED_IMPORTS
 import org.cqfn.diktat.ruleset.constants.Warnings.FILE_WILDCARD_IMPORTS
+import org.cqfn.diktat.ruleset.constants.Warnings.UNUSED_IMPORT
 import org.cqfn.diktat.ruleset.rules.PackageNaming.Companion.PACKAGE_SEPARATOR
-import org.cqfn.diktat.ruleset.utils.StandardPlatforms
-import org.cqfn.diktat.ruleset.utils.copyrightWords
-import org.cqfn.diktat.ruleset.utils.handleIncorrectOrder
-import org.cqfn.diktat.ruleset.utils.moveChildBefore
 
 import com.pinterest.ktlint.core.Rule
-import com.pinterest.ktlint.core.ast.ElementType
+import com.pinterest.ktlint.core.ast.*
 import com.pinterest.ktlint.core.ast.ElementType.BLOCK_COMMENT
 import com.pinterest.ktlint.core.ast.ElementType.EOL_COMMENT
 import com.pinterest.ktlint.core.ast.ElementType.FILE_ANNOTATION_LIST
 import com.pinterest.ktlint.core.ast.ElementType.IMPORT_DIRECTIVE
 import com.pinterest.ktlint.core.ast.ElementType.IMPORT_LIST
 import com.pinterest.ktlint.core.ast.ElementType.KDOC
+import com.pinterest.ktlint.core.ast.ElementType.OPERATION_REFERENCE
 import com.pinterest.ktlint.core.ast.ElementType.PACKAGE_DIRECTIVE
+import com.pinterest.ktlint.core.ast.ElementType.REFERENCE_EXPRESSION
 import com.pinterest.ktlint.core.ast.ElementType.WHITE_SPACE
-import com.pinterest.ktlint.core.ast.children
-import com.pinterest.ktlint.core.ast.isPartOfComment
-import com.pinterest.ktlint.core.ast.isWhiteSpace
-import com.pinterest.ktlint.core.ast.nextSibling
-import com.pinterest.ktlint.core.ast.prevSibling
+import org.cqfn.diktat.ruleset.constants.Warnings
+import org.cqfn.diktat.ruleset.utils.*
 import org.jetbrains.kotlin.com.intellij.lang.ASTNode
 import org.jetbrains.kotlin.com.intellij.psi.impl.source.tree.LeafPsiElement
 import org.jetbrains.kotlin.com.intellij.psi.impl.source.tree.PsiWhiteSpaceImpl
 import org.jetbrains.kotlin.com.intellij.psi.tree.TokenSet
 import org.jetbrains.kotlin.name.Name
-import org.jetbrains.kotlin.psi.KtFile
-import org.jetbrains.kotlin.psi.KtImportDirective
+import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.psi.psiUtil.siblings
 
 /**
@@ -66,6 +61,9 @@ class FileStructureRule(private val configRules: List<RulesConfig>) : Rule("file
         }
     private lateinit var emitWarn: EmitType
 
+    private val refSet = mutableSetOf<String>()
+    private var packageName = ""
+
     override fun visit(node: ASTNode,
                        autoCorrect: Boolean,
                        emit: EmitType) {
@@ -79,6 +77,10 @@ class FileStructureRule(private val configRules: List<RulesConfig>) : Rule("file
             val importsGroupingConfig = ImportsGroupingConfig(
                 this.configRules.getRuleConfig(FILE_UNORDERED_IMPORTS)?.configuration ?: emptyMap()
             )
+            val unusedImportConfig = UnusedImportConfig(
+                this.configRules.getRuleConfig(UNUSED_IMPORT)?.configuration ?: emptyMap()
+            )
+            checkUnusedImport(node, unusedImportConfig)
             node.findChildByType(IMPORT_LIST)
                 ?.let { checkImportsOrder(it, wildcardImportsConfig, importsGroupingConfig) }
             if (checkFileHasCode(node)) {
@@ -204,6 +206,52 @@ class FileStructureRule(private val configRules: List<RulesConfig>) : Rule("file
         }
     }
 
+    private fun checkUnusedImport(
+        node: ASTNode,
+        unusedImportConfig: UnusedImportConfig
+    ) {
+        node.findAllNodesWithSpecificType(REFERENCE_EXPRESSION)?.forEach {
+            if (!it.isPartOf(IMPORT_DIRECTIVE)) {
+                refSet.add(it.text)
+            }
+        }
+        node.findAllNodesWithSpecificType(OPERATION_REFERENCE)?.forEach {
+            if (!it.isPartOf(IMPORT_DIRECTIVE)) {
+                refSet.add(it.text)
+            }
+        }
+
+        packageName = (node.findChildByType(PACKAGE_DIRECTIVE)?.psi as KtPackageDirective).qualifiedName
+
+        node.findChildByType(IMPORT_LIST)?.getChildren(TokenSet.create(IMPORT_DIRECTIVE))?.toList()
+            ?.forEach { import ->
+                val ktImportDirective = import.psi as KtImportDirective
+                val importName = ktImportDirective.importPath?.importedName?.asString()
+                val importPath = ktImportDirective.importPath?.pathStr
+                if (ktImportDirective.aliasName == null &&
+                    !packageName.isEmpty() && importPath!!.startsWith("$packageName.") &&
+                    importPath.substring(packageName.length + 1).indexOf('.') == -1
+                ) {
+                    if (unusedImportConfig.deleteUnusedImport) {
+                        Warnings.UNUSED_IMPORT.warnAndFix(
+                            configRules, emitWarn, isFixMode,
+                            "$importPath - unused import",
+                            node.startOffset, node
+                        ) { ktImportDirective.delete() }
+                    }
+                } else if (importName != null && !refSet.contains(importName)) {
+                    if (unusedImportConfig.deleteUnusedImport) {
+                        Warnings.UNUSED_IMPORT.warnAndFix(
+                            configRules, emitWarn, isFixMode,
+                            "$importPath - unused import",
+                            node.startOffset, node
+                        ) { ktImportDirective.delete() }
+                    }
+                }
+
+            }
+    }
+
     private fun rearrangeImports(
         node: ASTNode,
         imports: List<ASTNode>,
@@ -313,5 +361,15 @@ class FileStructureRule(private val configRules: List<RulesConfig>) : Rule("file
          * Use imports grouping according to recommendation 3.1
          */
         val useRecommendedImportsOrder = config["useRecommendedImportsOrder"]?.toBoolean() ?: true
+    }
+
+    /**
+     * [RuleConfiguration] for unused import
+     */
+    class UnusedImportConfig(config: Map<String, String>) : RuleConfiguration(config) {
+        /**
+         * delete unused import
+         */
+        val deleteUnusedImport = config["deleteUnusedImport"]?.toBoolean() ?: true
     }
 }

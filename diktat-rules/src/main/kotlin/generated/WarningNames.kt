@@ -237,4 +237,6 @@ public object WarningNames {
     public const val INVERSE_FUNCTION_PREFERRED: String = "INVERSE_FUNCTION_PREFERRED"
 
     public const val TOO_MANY_LINES_IN_LAMBDA: String = "TOO_MANY_LINES_IN_LAMBDA"
+
+    public const val UNUSED_IMPORT: String = "UNUSED_IMPORT"
 }
